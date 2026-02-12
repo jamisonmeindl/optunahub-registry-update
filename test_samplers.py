@@ -53,6 +53,8 @@ _HEBO_UPDATED_VARIANTS = {
     "hebo_updated_rf",
     "hebo_updated_deep_ensemble",
     "hebo_updated_catboost",
+    "hebo_updated_psgld",
+    "hebo_updated_svidkl",
 }
 _HEBO_UPDATED_MODEL_NAME_BY_SAMPLER = {
     "hebo_updated": None,
@@ -60,6 +62,8 @@ _HEBO_UPDATED_MODEL_NAME_BY_SAMPLER = {
     "hebo_updated_rf": "rf",
     "hebo_updated_deep_ensemble": "deep_ensemble",
     "hebo_updated_catboost": "catboost",
+    "hebo_updated_psgld": "psgld",
+    "hebo_updated_svidkl": "svidkl",
 }
 
 _BBOB_DIMS = (2, 3, 5, 10, 20, 40)
@@ -206,8 +210,10 @@ def parse_args() -> argparse.Namespace:
             "autosampler",
             "hebo_updated_gp",
             "hebo_updated_rf",
-            "hebo_updated_deep_ensemble",
+            # "hebo_updated_deep_ensemble",
             "hebo_updated_catboost",
+            "hebo_updated_psgld",
+            "hebo_updated_svidkl",
             # "smac_mo",
             # "moead",
             # "speaii",
@@ -215,7 +221,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Samplers to compare (choices: random, tpe, nsgaii, nsgaiii, "
             "autosampler, hebo, hebo_updated, hebo_updated_gp, hebo_updated_rf, "
-            "hebo_updated_deep_ensemble, hebo_updated_catboost, smac, smac_mo, moead, speaii)."
+            "hebo_updated_deep_ensemble, hebo_updated_catboost, hebo_updated_psgld, "
+            "hebo_updated_svidkl, smac, smac_mo, moead, speaii)."
         ),
     )
     parser.add_argument(

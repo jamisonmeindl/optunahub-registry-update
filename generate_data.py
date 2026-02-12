@@ -48,12 +48,16 @@ _HEBO_UPDATED_VARIANTS = {
     "hebo_updated_rf",
     "hebo_updated_deep_ensemble",
     "hebo_updated_catboost",
+    "hebo_updated_psgld",
+    "hebo_updated_svidkl",
 }
 _HEBO_UPDATED_MODEL_NAME_BY_SAMPLER = {
     "hebo_updated_gp": "gp",
     "hebo_updated_rf": "rf",
     "hebo_updated_deep_ensemble": "deep_ensemble",
     "hebo_updated_catboost": "catboost",
+    "hebo_updated_psgld": "psgld",
+    "hebo_updated_svidkl": "svidkl",
 }
 _SYNTHETIC_ALIAS_COMPONENTS = {"aug", "noise", "fail"}
 _BINARY_CONSTRAINT_KEY = "_binary_constraint"
@@ -105,11 +109,14 @@ def parse_args() -> argparse.Namespace:
             "hebo_updated_rf",
             "hebo_updated_deep_ensemble",
             "hebo_updated_catboost",
+            "hebo_updated_psgld",
+            "hebo_updated_svidkl",
         ],
         help=(
             "HEBO methods to run: "
             "hebo, hebo_updated, hebo_updated_gp, hebo_updated_rf, "
-            "hebo_updated_deep_ensemble, hebo_updated_catboost."
+            "hebo_updated_deep_ensemble, hebo_updated_catboost, "
+            "hebo_updated_psgld, hebo_updated_svidkl."
         ),
     )
     parser.add_argument(
