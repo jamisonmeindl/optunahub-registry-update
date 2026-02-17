@@ -237,7 +237,7 @@ class GPFunctionEnv:
                 for v in self.param_config.values()
             ),
         )
-        self.num_samples = int(self.rng.integers(10 * self.N, 30 * self.N))
+        self.num_samples = int(self.rng.integers(self.N, 25 * self.N))
         self.X_initial_raw = self.sample(self.num_samples)
         self.X_initial_encoded = self.encode(self.X_initial_raw)
         self._build_surfaces()
@@ -364,7 +364,7 @@ class GPFunctionEnv:
         return K, chol
 
     def _create_surface(self, rng: np.random.Generator) -> _ObjectiveSurface:
-        max_kernels = int(rng.integers(1, 4))
+        max_kernels = int(rng.integers(1, 3))
         variances = [
             float(np.exp(rng.uniform(np.log(0.1), np.log(2.0))))
             for _ in range(max_kernels)
@@ -376,7 +376,7 @@ class GPFunctionEnv:
             variance = variances[min(idx, len(variances) - 1)]
             lengthscale = lengthscales[min(idx, len(lengthscales) - 1)]
             alpha = (
-                float(np.exp(rng.uniform(np.log(0.1), np.log(2.0))))
+                float(np.exp(rng.uniform(np.log(0.1), np.log(10.0))))
                 if ktype == KernelType.RATIONAL_QUADRATIC
                 else None
             )
@@ -384,7 +384,7 @@ class GPFunctionEnv:
             degree = None
             offset = None
             if ktype == KernelType.PERIODIC:
-                period = float(np.exp(rng.uniform(np.log(0.2), np.log(3.0))))
+                period = float(np.exp(rng.uniform(np.log(0.1), np.log(10.0))))
             if ktype == KernelType.POLYNOMIAL:
                 degree = int(rng.integers(2, 5))
                 offset = float(rng.uniform(0.5, 2.0))
@@ -799,10 +799,10 @@ class GPFunctionEnv:
                 entry["range"] = [low, high]
 
         else: # Categorical
-            if bool(self.rng.random() < 0.75):
-                num_categories = int(self.rng.choice([3, 4, 5, 10, 25, 50], p=[0.2, 0.2, 0.2, 0.2, 0.1, 0.1]))
+            if bool(self.rng.random() < 0.9):
+                num_categories = int(self.rng.integers(3, 11))
             else:
-                num_categories = int(self.rng.integers(3, 25))
+                num_categories = int(self.rng.integers(11, 51))
             prefix = str(self.rng.choice(["opt", "model", "act", "choice", "category"]))
             entry["categories"] = [f"{prefix}_{j}" for j in range(num_categories)]
             
