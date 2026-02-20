@@ -182,6 +182,15 @@ def parse_args() -> argparse.Namespace:
         help="Number of Optuna trials per optimizer."
     )
     parser.add_argument(
+        "--rand-sample",
+        type=int,
+        default=5,
+        help=(
+            "HEBO Updated random warmup trials before surrogate-driven suggestions. "
+            "Set to 0 to disable warmup."
+        ),
+    )
+    parser.add_argument(
         "--dim",
         type=int,
         default=5,
@@ -304,6 +313,7 @@ def _instantiate_sampler(
     search_space: dict[str, BaseDistribution],
     seed: int,
     n_trials: int,
+    rand_sample: int,
     hebo_module: Any,
     hebo_updated_module: Any,
     smac_module: Any,
@@ -349,10 +359,12 @@ def _instantiate_sampler(
         if hebo_updated_module is None:
             raise ValueError("HEBOSampler module is unavailable.")
         model_name = _HEBO_UPDATED_MODEL_NAME_BY_SAMPLER[name]
+        effective_rand_sample = min(int(rand_sample), max(int(n_trials) - 1, 0))
         sampler = hebo_updated_module.HEBOSampler(
             search_space=search_space,
             seed=seed,
             num_obj=num_objectives,
+            rand_sample=effective_rand_sample,
             model_name=model_name,
             track_surrogate_predictions=True,
             failure_constraint_model=use_binary_constraint,
@@ -613,11 +625,13 @@ def _synthetic_forced_dynamics_from_alias(benchmark: str) -> dict[str, bool]:
     }
 
 
-def _format_search_space(search_space: dict[str, BaseDistribution]) -> str:
-    if not search_space:
-        return "(empty search space)"
-    lines = [f"- {name}: {dist}" for name, dist in search_space.items()]
-    return "\n".join(lines)
+def _serialize_search_space(
+    search_space: dict[str, BaseDistribution],
+) -> dict[str, Any]:
+    return {
+        name: optuna.distributions.distribution_to_json(dist)
+        for name, dist in search_space.items()
+    }
 
 
 def _problem_name(problem: Any, benchmark: str, idx: int) -> str:
@@ -942,6 +956,7 @@ def _run_single_problem(
         "benchmark": args.benchmark,
         "problem_index": idx,
         "problem_kwargs": problem_kwargs,
+        "search_space": _serialize_search_space(problem.search_space),
         "directions": [direction.name for direction in directions],
         "samplers": [],
     }
@@ -975,6 +990,7 @@ def _run_single_problem(
             problem.search_space,
             sampler_seed,
             args.trials,
+            args.rand_sample,
             hebo_module,
             hebo_updated_module,
             smac_module,
@@ -992,6 +1008,7 @@ def _run_single_problem(
             study_kwargs["directions"] = directions
 
         study = optuna.create_study(**study_kwargs)
+        start_time = time.perf_counter()
         with _maybe_suppress_sampler_output(args.sampler_output == "hide"):
             study.optimize(
                 lambda trial: _objective(problem, trial, use_binary_constraint),
@@ -999,6 +1016,9 @@ def _run_single_problem(
                 catch=(_ConstraintViolationError,),
                 callbacks=[_history_callback(problem_name, sampler_name, args.print_step_history)],
             )
+        elapsed = time.perf_counter() - start_time
+        evaluation_count = len(study.trials)
+        seconds_per_evaluation = elapsed / max(1, evaluation_count)
         studies.append(study)
         best_values = _extract_best_values(study, len(directions))
         if len(directions) == 1:
@@ -1017,6 +1037,9 @@ def _run_single_problem(
                 "best_values": best_values,
                 "best_params": best_params,
                 "trial_state_counts": dict(Counter(t.state.name for t in study.trials)),
+                "evaluation_seconds": elapsed,
+                "evaluation_count": evaluation_count,
+                "seconds_per_evaluation": seconds_per_evaluation,
             }
         )
 
@@ -1044,6 +1067,9 @@ def _run_single_problem(
             "hypervolume": hypervolume_score,
             "best_params": result["best_params"],
             "trial_state_counts": result["trial_state_counts"],
+            "evaluation_seconds": result["evaluation_seconds"],
+            "evaluation_count": result["evaluation_count"],
+            "seconds_per_evaluation": result["seconds_per_evaluation"],
         }
         if len(result["best_values"]) == 1:
             sampler_entry["best_value"] = result["best_values"][0]
@@ -1146,6 +1172,8 @@ def _shutdown_executor(
 
 def main() -> None:
     args = parse_args()
+    if args.rand_sample < 0:
+        raise ValueError(f"--rand-sample must be >= 0, got {args.rand_sample}.")
     optuna.logging.set_verbosity(getattr(optuna.logging, args.optuna_log_level))
     
     if args.output_file is None:
@@ -1236,6 +1264,10 @@ def main() -> None:
 
     # Post-processing aggregation
     aggregate: dict[str, list[float]] = {name: [] for name in args.samplers}
+    timing_aggregate: dict[str, dict[str, float]] = {
+        name: {"total_seconds": 0.0, "total_evals": 0.0, "runs": 0.0}
+        for name in args.samplers
+    }
     
     for info in detailed_results:
         for sampler_entry in info["samplers"]:
@@ -1243,12 +1275,28 @@ def main() -> None:
             hv = sampler_entry.get("hypervolume", 0.0)
             if name in aggregate:
                 aggregate[name].append(hv)
+            if name in timing_aggregate:
+                timing_aggregate[name]["total_seconds"] += float(
+                    sampler_entry.get("evaluation_seconds", 0.0)
+                )
+                timing_aggregate[name]["total_evals"] += float(
+                    sampler_entry.get("evaluation_count", 0)
+                )
+                timing_aggregate[name]["runs"] += 1.0
 
     summary = {
         "aggregate": {
             name: {
                 "mean_hypervolume": float(mean(scores)) if scores else 0.0,
                 "runs": len(scores),
+                "timing": {
+                    "total_seconds": float(timing_aggregate[name]["total_seconds"]),
+                    "total_evaluations": int(timing_aggregate[name]["total_evals"]),
+                    "mean_seconds_per_evaluation": float(
+                        timing_aggregate[name]["total_seconds"]
+                        / max(1.0, timing_aggregate[name]["total_evals"])
+                    ),
+                },
             }
             for name, scores in aggregate.items()
         },

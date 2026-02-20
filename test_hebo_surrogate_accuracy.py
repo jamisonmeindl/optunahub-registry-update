@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import io
 import json
 import logging
 import math
 import os
+import signal
+import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -24,6 +28,7 @@ import optunahub
 import pandas as pd
 from optuna.distributions import BaseDistribution, CategoricalDistribution, FloatDistribution, IntDistribution
 from optunahub import hub as _hub
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -155,8 +160,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rand-sample",
         type=int,
-        default=None,
-        help="Override HEBO random warmup trials (None = backend default).",
+        default=5,
+        help=(
+            "HEBO random warmup trials before surrogate-driven suggestions. "
+            "Set to 0 to disable warmup."
+        ),
     )
     parser.add_argument(
         "--global-optimum-samples",
@@ -183,6 +191,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Output JSON path.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="Number of worker processes (1 disables multiprocessing).",
     )
     return parser.parse_args()
 
@@ -684,7 +698,39 @@ def _rankdata(a: np.ndarray) -> np.ndarray:
     return ranks
 
 
-def _compute_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
+def _compute_normalization_bounds(
+    records: list[dict[str, Any]],
+) -> tuple[float, float]:
+    true_values_all = np.asarray(
+        [
+            float(r["true_value"])
+            for r in records
+            if r.get("true_value") is not None and np.isfinite(float(r["true_value"]))
+        ],
+        dtype=float,
+    )
+    if true_values_all.size > 0:
+        global_min = float(np.min(true_values_all))
+        global_max = float(np.max(true_values_all))
+    else:
+        global_min = 0.0
+        global_max = 0.0
+    return global_min, global_max
+
+
+def _compute_metrics(
+    records: list[dict[str, Any]],
+    *,
+    normalization_min: float | None = None,
+    normalization_max: float | None = None,
+) -> dict[str, Any]:
+    if normalization_min is None or normalization_max is None:
+        global_min, global_max = _compute_normalization_bounds(records)
+    else:
+        global_min = float(normalization_min)
+        global_max = float(normalization_max)
+    scale = max(global_max - global_min, 1e-12)
+
     valid = [
         r
         for r in records
@@ -698,20 +744,14 @@ def _compute_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
             "n_trials_total": len(records),
             "n_with_prediction": 0,
             "n_without_prediction": len(records),
+            "normalization_scale": scale,
+            "normalization_min": global_min,
+            "normalization_max": global_max,
         }
 
     y = np.asarray([float(r["true_value"]) for r in valid], dtype=float)
     yhat = np.asarray([float(r["pred_mean"]) for r in valid], dtype=float)
     err = yhat - y
-
-    # Scale used for normalized errors. We prefer target magnitude, and
-    # fall back to prediction spread/magnitude when the target is near zero.
-    scale_candidates = [
-        float(np.max(np.abs(y))) if len(y) > 0 else 0.0,
-        float(np.std(yhat)) if len(yhat) > 0 else 0.0,
-        float(np.mean(np.abs(yhat))) if len(yhat) > 0 else 0.0,
-    ]
-    scale = max([v for v in scale_candidates if np.isfinite(v)] + [1.0, 1e-12])
 
     mae = float(np.mean(np.abs(err)))
     rmse = float(np.sqrt(np.mean(err**2)))
@@ -738,6 +778,7 @@ def _compute_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     coverage_1sigma = None
     nll = None
+    normalized_mean_nll = None
     if with_std:
         y_std = np.asarray([float(r["pred_std"]) for r in with_std], dtype=float)
         y_true_std = np.asarray([float(r["true_value"]) for r in with_std], dtype=float)
@@ -748,6 +789,7 @@ def _compute_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
         sq_err = (yhat_std - y_true_std) ** 2
         nll_terms = 0.5 * np.log(2.0 * math.pi * sigma**2) + sq_err / (2.0 * sigma**2)
         nll = float(np.mean(nll_terms))
+        normalized_mean_nll = float(nll / scale)
 
     return {
         "n_trials_total": len(records),
@@ -761,12 +803,52 @@ def _compute_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
         "normalized_rmse": normalized_rmse,
         "normalized_bias": normalized_bias,
         "normalization_scale": scale,
+        "normalization_min": global_min,
+        "normalization_max": global_max,
         "pearson": pearson,
         "spearman": spearman,
         "coverage_1sigma": coverage_1sigma,
+        "mean_nll": nll,
+        "normalized_mean_nll": normalized_mean_nll,
         "nll": nll,
         "gaussian_nll": nll,
     }
+
+
+def _compute_shared_normalization_bounds_by_option(
+    records_by_option: dict[str, list[dict[str, Any]]],
+) -> tuple[float, float]:
+    merged_records = [
+        record
+        for records in records_by_option.values()
+        for record in records
+    ]
+    return _compute_normalization_bounds(merged_records)
+
+
+def _compute_benchmark_normalization_bounds(
+    rows: list[dict[str, Any]],
+) -> dict[str, tuple[float, float]]:
+    values_by_benchmark: dict[str, list[float]] = {}
+    for row in rows:
+        benchmark = str(row.get("benchmark"))
+        optimum = row.get("global_optimum", {})
+        value = optimum.get("value") if isinstance(optimum, dict) else None
+        if value is None:
+            continue
+        value_f = float(value)
+        if not np.isfinite(value_f):
+            continue
+        values_by_benchmark.setdefault(benchmark, []).append(value_f)
+
+    bounds: dict[str, tuple[float, float]] = {}
+    for benchmark, values in values_by_benchmark.items():
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0:
+            bounds[benchmark] = (0.0, 0.0)
+        else:
+            bounds[benchmark] = (float(np.min(arr)), float(np.max(arr)))
+    return bounds
 
 
 def _average_metrics(metric_rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -790,6 +872,20 @@ def _average_metrics(metric_rows: list[dict[str, Any]]) -> dict[str, Any]:
         if values:
             averaged[key] = float(np.mean(values))
     return averaged
+
+
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [_to_jsonable(v) for v in value.tolist()]
+    if isinstance(value, np.generic):
+        return _to_jsonable(value.item())
+    if isinstance(value, Path):
+        return str(value)
+    return value
 
 
 def _build_callback(
@@ -832,19 +928,192 @@ def _build_callback(
     return _callback
 
 
+def _run_single_problem(
+    *,
+    benchmark: str,
+    idx: int,
+    args: argparse.Namespace,
+    registry_root: Path,
+    benchmark_module_name: str,
+) -> dict[str, Any]:
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    _configure_sampler_library_logging(args.sampler_output == "hide")
+
+    benchmark_module = _load_module(benchmark_module_name, registry_root)
+    hebo_updated_module = _load_module("samplers/hebo_updated", registry_root)
+
+    problem_kwargs = _make_problem_kwargs(args, benchmark, idx, benchmark_module)
+    problem = benchmark_module.Problem(**problem_kwargs)
+    p_name = _problem_name(problem, benchmark, idx)
+    global_optimum_params, global_optimum_value, global_optimum_source = _resolve_global_optimum(
+        problem,
+        benchmark=benchmark,
+        seed=args.seed + args.problem_offset + idx,
+        n_samples=args.global_optimum_samples,
+    )
+
+    row: dict[str, Any] = {
+        "problem": p_name,
+        "benchmark": benchmark,
+        "problem_index": idx,
+        "problem_kwargs": problem_kwargs,
+        "global_optimum": {
+            "source": global_optimum_source,
+            "params": global_optimum_params,
+            "value": float(global_optimum_value),
+        },
+        "options": [],
+        "_records_by_option": {},
+        "_metrics_by_option": {},
+    }
+
+    for option in args.hebo_options:
+        model_name = _HEBO_UPDATED_MODEL_NAME_BY_SAMPLER[option]
+        sampler_seed = args.seed + args.problem_offset + idx
+        requested_rand_sample = int(args.rand_sample)
+        effective_rand_sample = min(requested_rand_sample, max(args.trials - 1, 0))
+        sampler_kwargs: dict[str, Any] = {
+            "search_space": problem.search_space,
+            "seed": sampler_seed,
+            "num_obj": 1,
+            "rand_sample": effective_rand_sample,
+            "track_surrogate_predictions": True,
+        }
+        if model_name is not None:
+            sampler_kwargs["model_name"] = model_name
+        sampler = hebo_updated_module.HEBOSampler(**sampler_kwargs)
+        study = optuna.create_study(direction=problem.directions[0], sampler=sampler)
+
+        records: list[dict[str, Any]] = []
+        callback = _build_callback(
+            problem_name=p_name,
+            option_name=option,
+            records=records,
+            global_optimum_params=global_optimum_params,
+            global_optimum_value=global_optimum_value,
+            search_space=problem.search_space,
+            enabled=args.print_step_history,
+        )
+        with _maybe_suppress_sampler_output(args.sampler_output == "hide"):
+            study.optimize(
+                lambda trial: _objective(problem, trial),
+                n_trials=args.trials,
+                callbacks=[callback],
+            )
+
+        row["options"].append(
+            {
+                "name": option,
+                "model_name": model_name,
+                "rand_sample": requested_rand_sample,
+                "effective_rand_sample": effective_rand_sample,
+                "best_value": float(study.best_value),
+            }
+        )
+        row["_records_by_option"][option] = records
+
+    shared_min, shared_max = _compute_shared_normalization_bounds_by_option(
+        row["_records_by_option"]
+    )
+    for option_row in row["options"]:
+        option_name = option_row["name"]
+        metrics = _compute_metrics(
+            row["_records_by_option"][option_name],
+            normalization_min=shared_min,
+            normalization_max=shared_max,
+        )
+        option_row["metrics"] = metrics
+        row["_metrics_by_option"][option_name] = metrics
+
+    return row
+
+
+def _run_single_problem_task(task: tuple) -> tuple[tuple[int, int], dict[str, Any]]:
+    benchmark_order, idx, benchmark, args_dict, registry_root_str, benchmark_module_name = task
+    args = argparse.Namespace(**args_dict)
+    registry_root = Path(registry_root_str)
+    result = _run_single_problem(
+        benchmark=benchmark,
+        idx=idx,
+        args=args,
+        registry_root=registry_root,
+        benchmark_module_name=benchmark_module_name,
+    )
+    return (benchmark_order, idx), result
+
+
+def _snapshot_executor_processes(
+    executor: concurrent.futures.ProcessPoolExecutor | None,
+) -> list[Any]:
+    if executor is None:
+        return []
+    raw_processes = getattr(executor, "_processes", None)
+    if not raw_processes:
+        return []
+    return [process for process in raw_processes.values() if process is not None]
+
+
+def _force_stop_processes(
+    processes: list[Any],
+    *,
+    grace_period_sec: float = 2.0,
+) -> None:
+    if not processes:
+        return
+
+    for process in processes:
+        if not process.is_alive():
+            continue
+        try:
+            process.terminate()
+        except Exception as exc:
+            logger.debug("Failed to terminate worker pid=%s: %s", process.pid, exc)
+
+    if grace_period_sec > 0.0:
+        deadline = time.monotonic() + grace_period_sec
+        while time.monotonic() < deadline:
+            if not any(process.is_alive() for process in processes):
+                return
+            time.sleep(0.05)
+
+    for process in processes:
+        if not process.is_alive():
+            continue
+        try:
+            if hasattr(process, "kill"):
+                process.kill()
+            elif process.pid is not None:
+                os.kill(process.pid, signal.SIGKILL)
+        except Exception as exc:
+            logger.debug("Failed to kill worker pid=%s: %s", process.pid, exc)
+
+
+def _shutdown_executor(
+    executor: concurrent.futures.ProcessPoolExecutor | None,
+    *,
+    cancel_futures: bool,
+    force_kill: bool,
+) -> None:
+    if executor is None:
+        return
+    processes = _snapshot_executor_processes(executor)
+    if force_kill:
+        _force_stop_processes(processes)
+    executor.shutdown(wait=False, cancel_futures=cancel_futures)
+    if force_kill:
+        _force_stop_processes(processes, grace_period_sec=0.0)
+
+
 def main() -> None:
     args = parse_args()
+    if args.rand_sample < 0:
+        raise ValueError(f"--rand-sample must be >= 0, got {args.rand_sample}.")
     args.hebo_options = _normalize_hebo_options(args.hebo_options)
     args.benchmarks = _normalize_benchmarks(args.benchmarks, args.benchmark)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     _configure_sampler_library_logging(args.sampler_output == "hide")
 
     registry_root = _resolve_registry_root()
-    hebo_updated_module = _load_module("samplers/hebo_updated", registry_root)
-    benchmark_modules: dict[str, Any] = {
-        benchmark: _load_module(_benchmark_module_name(benchmark), registry_root)
-        for benchmark in args.benchmarks
-    }
 
     if args.output_file is None:
         benchmark_tag = args.benchmarks[0] if len(args.benchmarks) == 1 else "all"
@@ -856,98 +1125,117 @@ def main() -> None:
 
     aggregate_records: dict[str, list[dict[str, Any]]] = {opt: [] for opt in args.hebo_options}
     aggregate_metric_rows: dict[str, list[dict[str, Any]]] = {opt: [] for opt in args.hebo_options}
-    details: list[dict[str, Any]] = []
 
-    for benchmark in args.benchmarks:
-        benchmark_module = benchmark_modules[benchmark]
-        logger.info("Running benchmark: %s", benchmark)
-        for idx in range(args.n_problems):
-            problem_kwargs = _make_problem_kwargs(args, benchmark, idx, benchmark_module)
-            problem = benchmark_module.Problem(**problem_kwargs)
+    tasks = [
+        (
+            benchmark_order,
+            idx,
+            benchmark,
+            vars(args).copy(),
+            str(registry_root),
+            _benchmark_module_name(benchmark),
+        )
+        for benchmark_order, benchmark in enumerate(args.benchmarks)
+        for idx in range(args.n_problems)
+    ]
+    worker_count = max(1, min(args.workers, len(tasks)))
+    logger.info(
+        "Running %d benchmark problems using %d workers.",
+        len(tasks),
+        worker_count,
+    )
 
-            p_name = _problem_name(problem, benchmark, idx)
-            logger.info(
-                "Running problem %d/%d [%s]: %s",
-                idx + 1,
-                args.n_problems,
-                benchmark,
-                p_name,
-            )
-            global_optimum_params, global_optimum_value, global_optimum_source = _resolve_global_optimum(
-                problem,
-                benchmark=benchmark,
-                seed=args.seed + args.problem_offset + idx,
-                n_samples=args.global_optimum_samples,
-            )
-
-            row: dict[str, Any] = {
-                "problem": p_name,
-                "benchmark": benchmark,
-                "problem_index": idx,
-                "problem_kwargs": problem_kwargs,
-                "global_optimum": {
-                    "source": global_optimum_source,
-                    "params": global_optimum_params,
-                    "value": float(global_optimum_value),
-                },
-                "options": [],
+    results_by_key: dict[tuple[int, int], dict[str, Any]] = {}
+    executor = None
+    try:
+        if worker_count == 1:
+            with tqdm(total=len(tasks), desc="Problems", unit="prob") as pbar:
+                for task in tasks:
+                    key = (task[0], task[1])
+                    try:
+                        _, info = _run_single_problem_task(task)
+                        results_by_key[key] = info
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as exc:
+                        logger.error("Task %s failed: %s", key, exc)
+                    pbar.update(1)
+        else:
+            executor = concurrent.futures.ProcessPoolExecutor(max_workers=worker_count)
+            future_to_task = {
+                executor.submit(_run_single_problem_task, task): task for task in tasks
             }
+            with tqdm(total=len(future_to_task), desc="Problems", unit="prob") as pbar:
+                for future in concurrent.futures.as_completed(future_to_task):
+                    task = future_to_task[future]
+                    key = (task[0], task[1])
+                    try:
+                        result_key, info = future.result()
+                        results_by_key[result_key] = info
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as exc:
+                        logger.error("Task %s failed in worker: %s", key, exc)
+                    pbar.update(1)
+            executor.shutdown(wait=True)
+    except KeyboardInterrupt:
+        logger.warning("\nReceived Ctrl+C. Stopping workers immediately...")
+        _shutdown_executor(executor, cancel_futures=True, force_kill=True)
+        sys.exit(1)
+    except Exception as exc:
+        logger.error("Unexpected global error: %s", exc)
+        _shutdown_executor(executor, cancel_futures=True, force_kill=True)
+        sys.exit(1)
 
-            for option in args.hebo_options:
-                model_name = _HEBO_UPDATED_MODEL_NAME_BY_SAMPLER[option]
-                sampler_seed = args.seed + args.problem_offset + idx
-                sampler_kwargs: dict[str, Any] = {
-                    "search_space": problem.search_space,
-                    "seed": sampler_seed,
-                    "num_obj": 1,
-                    "rand_sample": args.rand_sample,
-                    "track_surrogate_predictions": True,
-                }
-                if model_name is not None:
-                    sampler_kwargs["model_name"] = model_name
-                sampler = hebo_updated_module.HEBOSampler(
-                    **sampler_kwargs,
-                )
-                study = optuna.create_study(direction=problem.directions[0], sampler=sampler)
+    details: list[dict[str, Any]] = []
+    ordered_rows = [results_by_key[key] for key in sorted(results_by_key.keys())]
+    benchmark_bounds = _compute_benchmark_normalization_bounds(ordered_rows)
+    for key in sorted(results_by_key.keys()):
+        row = results_by_key[key]
+        benchmark = str(row.get("benchmark"))
+        benchmark_min, benchmark_max = benchmark_bounds.get(benchmark, (0.0, 0.0))
+        option_rows = {str(opt["name"]): opt for opt in row.get("options", [])}
+        for option in args.hebo_options:
+            records = row["_records_by_option"].get(option, [])
+            metrics = _compute_metrics(
+                records,
+                normalization_min=benchmark_min,
+                normalization_max=benchmark_max,
+            )
+            row["_metrics_by_option"][option] = metrics
+            if option in option_rows:
+                option_rows[option]["metrics"] = metrics
+            aggregate_records[option].extend(records)
+            aggregate_metric_rows[option].append(metrics)
+            logger.info(
+                "problem=%s option=%s model=%s pred_points=%d mae=%s rmse=%s",
+                row["problem"],
+                option,
+                _HEBO_UPDATED_MODEL_NAME_BY_SAMPLER[option],
+                metrics.get("n_with_prediction", 0),
+                metrics.get("mae"),
+                metrics.get("rmse"),
+            )
+        row.pop("_records_by_option", None)
+        row.pop("_metrics_by_option", None)
+        details.append(row)
 
-                records: list[dict[str, Any]] = []
-                callback = _build_callback(
-                    problem_name=p_name,
-                    option_name=option,
-                    records=records,
-                    global_optimum_params=global_optimum_params,
-                    global_optimum_value=global_optimum_value,
-                    search_space=problem.search_space,
-                    enabled=args.print_step_history,
-                )
-                with _maybe_suppress_sampler_output(args.sampler_output == "hide"):
-                    study.optimize(
-                        lambda trial: _objective(problem, trial),
-                        n_trials=args.trials,
-                        callbacks=[callback],
-                    )
-
-                metrics = _compute_metrics(records)
-                aggregate_records[option].extend(records)
-                aggregate_metric_rows[option].append(metrics)
-                row["options"].append(
-                    {
-                        "name": option,
-                        "model_name": model_name,
-                        "best_value": float(study.best_value),
-                        "metrics": metrics,
-                    }
-                )
-                logger.info(
-                    "  option=%s model=%s pred_points=%d mae=%s rmse=%s",
-                    option,
-                    model_name,
-                    metrics.get("n_with_prediction", 0),
-                    metrics.get("mae"),
-                    metrics.get("rmse"),
-                )
-
-            details.append(row)
+    pooled_values = np.asarray(
+        [
+            float(row["global_optimum"]["value"])
+            for row in ordered_rows
+            if isinstance(row.get("global_optimum"), dict)
+            and row["global_optimum"].get("value") is not None
+            and np.isfinite(float(row["global_optimum"]["value"]))
+        ],
+        dtype=float,
+    )
+    if pooled_values.size > 0:
+        pooled_min = float(np.min(pooled_values))
+        pooled_max = float(np.max(pooled_values))
+    else:
+        pooled_min = 0.0
+        pooled_max = 0.0
 
     summary = {
         "config": {
@@ -965,16 +1253,26 @@ def main() -> None:
             "rand_sample": args.rand_sample,
             "global_optimum_samples": args.global_optimum_samples,
         },
+        "normalization_bounds_by_benchmark": {
+            benchmark: {"min": bounds[0], "max": bounds[1]}
+            for benchmark, bounds in benchmark_bounds.items()
+        },
+        "normalization_bounds_pooled": {"min": pooled_min, "max": pooled_max},
         "aggregate_average": {
             option: _average_metrics(metric_rows)
             for option, metric_rows in aggregate_metric_rows.items()
         },
         "aggregate_pooled": {
-            option: _compute_metrics(records) for option, records in aggregate_records.items()
+            option: _compute_metrics(
+                records,
+                normalization_min=pooled_min,
+                normalization_max=pooled_max,
+            )
+            for option, records in aggregate_records.items()
         },
         "details": details,
     }
-    args.output_file.write_text(json.dumps(summary, indent=2))
+    args.output_file.write_text(json.dumps(_to_jsonable(summary), indent=2))
     logger.info("Saved surrogate accuracy summary to %s", args.output_file)
 
 

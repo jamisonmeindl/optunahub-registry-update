@@ -102,12 +102,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trials", type=int, default=25, help="Optuna trials per run.")
     parser.add_argument(
+        "--rand-sample",
+        type=int,
+        default=5,
+        help=(
+            "HEBO Updated random warmup trials before surrogate-driven suggestions. "
+            "Set to 0 to disable warmup."
+        ),
+    )
+    parser.add_argument(
         "--samplers",
         nargs="+",
         default=[
             "hebo_updated_gp",
             "hebo_updated_rf",
-            "hebo_updated_deep_ensemble",
+            # "hebo_updated_deep_ensemble",
             "hebo_updated_catboost",
             "hebo_updated_psgld",
             "hebo_updated_svidkl",
@@ -245,6 +254,8 @@ def _instantiate_sampler(
     *,
     search_space: dict[str, BaseDistribution],
     seed: int,
+    n_trials: int,
+    rand_sample: int,
     num_objectives: int,
     hebo_module: Any,
     hebo_updated_module: Any,
@@ -264,10 +275,12 @@ def _instantiate_sampler(
         return hebo_module.HEBOSampler(search_space=search_space, seed=seed, num_obj=num_objectives)
     if sampler_name in _HEBO_UPDATED_VARIANTS:
         model_name = _HEBO_UPDATED_MODEL_NAME_BY_SAMPLER[sampler_name]
+        effective_rand_sample = min(int(rand_sample), max(int(n_trials) - 1, 0))
         kwargs: dict[str, Any] = {
             "search_space": search_space,
             "seed": seed,
             "num_obj": num_objectives,
+            "rand_sample": effective_rand_sample,
             "track_surrogate_predictions": True,
             "failure_constraint_model": use_binary_constraint,
             "constraints_func": _binary_constraints if use_binary_constraint else None,
@@ -308,6 +321,10 @@ def _serialize_search_space(
         name: optuna.distributions.distribution_to_json(dist)
         for name, dist in search_space.items()
     }
+
+
+def _format_seconds(seconds: float) -> str:
+    return f"{seconds:.3f}s"
 
 
 def _build_trajectory_entries(
@@ -407,6 +424,7 @@ def _run_single_function(
         data_type=args.data_type,
         options=dict(base_options),
     )
+    search_space_json = _serialize_search_space(problem.search_space)
     sampler_runs: dict[str, dict[str, Any]] = {}
     use_binary_constraint = bool(base_options.get("has_failure_regions", False))
     for sampler_name in args.samplers:
@@ -414,6 +432,8 @@ def _run_single_function(
             sampler_name,
             search_space=problem.search_space,
             seed=function_id,
+            n_trials=args.trials,
+            rand_sample=args.rand_sample,
             num_objectives=problem.num_objectives,
             hebo_module=hebo_module,
             hebo_updated_module=hebo_updated_module,
@@ -431,12 +451,18 @@ def _run_single_function(
             return problem.evaluate(trial.params)
 
         study = optuna.create_study(sampler=sampler, directions=problem.directions)
+        start_time = time.perf_counter()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
             io.StringIO()
         ):
             study.optimize(objective, n_trials=args.trials)
+        elapsed = time.perf_counter() - start_time
+        evaluation_count = len(study.trials)
         sampler_runs[sampler_name] = {
             "sampler_seed": function_id,
+            "evaluation_seconds": elapsed,
+            "evaluation_count": evaluation_count,
+            "seconds_per_evaluation": elapsed / max(1, evaluation_count),
             "trajectory_entries": _build_trajectory_entries(
                 study, sampler, start=args.trajectory_start, end=args.trajectory_end
             ),
@@ -446,6 +472,7 @@ def _run_single_function(
         "function_id": function_id,
         "problem_seed": function_id,
         "directions": [d.name for d in problem.directions],
+        "search_space": search_space_json,
         "samplers": sampler_runs,
         "failed": False,
     }
@@ -542,6 +569,8 @@ def _shutdown_executor(
 
 def main() -> None:
     args = parse_args()
+    if args.rand_sample < 0:
+        raise ValueError(f"--rand-sample must be >= 0, got {args.rand_sample}.")
     optuna.logging.set_verbosity(optuna.logging.ERROR)
     
     function_ids = _parse_function_ids(args.function_ids)
@@ -563,6 +592,21 @@ def main() -> None:
     }
     base_options.update(_synthetic_forced_dynamics_from_alias(args.benchmark))
     base_options.update(extra_options)
+    try:
+        synthetic_module = _load_module("benchmarks/synthetic", registry_root)
+        first_problem = synthetic_module.Problem(
+            dim=args.dim,
+            seed=function_ids[0],
+            data_type=args.data_type,
+            options=dict(base_options),
+        )
+        logger.info(
+            "Parameter space used (seed %d): %s",
+            function_ids[0],
+            json.dumps(_serialize_search_space(first_problem.search_space), sort_keys=True),
+        )
+    except Exception as exc:
+        logger.warning("Could not print parameter space before execution: %s", exc)
 
     runs_by_index: dict[int, dict[str, Any]] = {}
     tasks = [
@@ -663,6 +707,45 @@ def main() -> None:
         logger.warning("No runs completed. Nothing to save.")
         return
 
+    # Print per-seed/per-method timing and aggregate per-method timing.
+    timing_summary: dict[str, dict[str, float]] = {}
+    for run in runs:
+        if run.get("failed"):
+            continue
+        function_id = run.get("function_id")
+        for sampler_name, sampler_data in run.get("samplers", {}).items():
+            total_sec = float(sampler_data.get("evaluation_seconds", 0.0))
+            eval_count = int(sampler_data.get("evaluation_count", 0))
+            per_eval_sec = float(sampler_data.get("seconds_per_evaluation", 0.0))
+            logger.info(
+                "Timing | seed=%s method=%s total=%s evals=%d per_eval=%s",
+                function_id,
+                sampler_name,
+                _format_seconds(total_sec),
+                eval_count,
+                _format_seconds(per_eval_sec),
+            )
+            agg = timing_summary.setdefault(
+                sampler_name, {"total_seconds": 0.0, "total_evals": 0.0, "runs": 0.0}
+            )
+            agg["total_seconds"] += total_sec
+            agg["total_evals"] += float(eval_count)
+            agg["runs"] += 1.0
+
+    for sampler_name, agg in timing_summary.items():
+        total_seconds = agg["total_seconds"]
+        total_evals = int(agg["total_evals"])
+        run_count = int(agg["runs"])
+        mean_per_eval = total_seconds / max(1, total_evals)
+        logger.info(
+            "Timing summary | method=%s runs=%d total=%s evals=%d mean_per_eval=%s",
+            sampler_name,
+            run_count,
+            _format_seconds(total_seconds),
+            total_evals,
+            _format_seconds(mean_per_eval),
+        )
+
     output_path = _build_output_path(
         args.output_dir,
         args.benchmark,
@@ -673,22 +756,12 @@ def main() -> None:
         args.trials,
     )
     
-    # Attempt to load metadata from the first successful run for schema consistency
-    # If all failed, we construct a dummy object or empty dict
+    # Attempt to load metadata from first successful run for schema consistency.
     space_json = {}
     try:
-        # Find first non-failed run to grab metadata
         valid_run = next((r for r in runs if not r.get("failed")), None)
-        if valid_run:
-            seed_for_meta = valid_run["problem_seed"]
-            synthetic_module = _load_module("benchmarks/synthetic", registry_root)
-            problem_inst = synthetic_module.Problem(
-                dim=args.dim,
-                seed=seed_for_meta,
-                data_type=args.data_type,
-                options=dict(base_options),
-            )
-            space_json = _serialize_search_space(problem_inst.search_space)
+        if valid_run and "search_space" in valid_run:
+            space_json = dict(valid_run["search_space"])
     except Exception as e:
         logger.warning(f"Could not generate metadata schema: {e}")
 
@@ -701,6 +774,7 @@ def main() -> None:
             "function_ids": function_ids,
             "samplers": args.samplers,
             "trials": args.trials,
+            "rand_sample": args.rand_sample,
             "options": base_options,
             "search_space": space_json,
         },

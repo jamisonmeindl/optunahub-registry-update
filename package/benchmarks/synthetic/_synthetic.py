@@ -237,7 +237,13 @@ class GPFunctionEnv:
                 for v in self.param_config.values()
             ),
         )
-        self.num_samples = int(self.rng.integers(self.N, 25 * self.N))
+        # self.num_samples = int(self.rng.integers(max(10,self.N), 25 * self.N))
+        cap = 1024  # or 2048 if you want heavier surfaces
+
+        mult = float(np.exp(self.rng.uniform(np.log(1.0), np.log(10.0))))
+        base = mult * self.N
+
+        self.num_samples = int(np.clip(base, 64, cap))
         self.X_initial_raw = self.sample(self.num_samples)
         self.X_initial_encoded = self.encode(self.X_initial_raw)
         self._build_surfaces()
@@ -255,70 +261,57 @@ class GPFunctionEnv:
         self._force_does_augmentations = _coerce_optional_bool(
             opts.get("does_augmentations"), "does_augmentations"
         )
-        noise_requested = (
-            self._force_adds_noise is True
-            or any(key in opts for key in ("noise_level", "noise_variant"))
-        )
-        self.noise_level = float(options.get("noise_level", 0.02)) if options else 0.02
-        raw_noise_variant = opts.get("noise_variant")
-        if raw_noise_variant is None and self._force_adds_noise:
-            raw_noise_variant = self.noise_rng.choice(_BBOB_NOISE_VARIANTS)
-        self.noise_variant = _normalize_noise_variant(raw_noise_variant)
-        if self._force_adds_noise is None and not noise_requested:
-            self.noise_active = False
-        elif self._force_adds_noise is None:
-            self.noise_active = True
+        self.noise_active = self._force_adds_noise is True
+        if self.noise_active:
+            regime = self.noise_rng.choice(["low", "med", "high", "wild"], p=[0.55, 0.25, 0.15, 0.05])
+            if regime == "low":
+                lvl = 10 ** self.noise_rng.uniform(-2.7, -1.7)  # ~0.002-0.02
+            elif regime == "med":
+                lvl = 10 ** self.noise_rng.uniform(-1.7, -1.1)  # ~0.02-0.08
+            elif regime == "high":
+                lvl = 10 ** self.noise_rng.uniform(-1.1, -0.5)  # ~0.08-0.3
+            else:
+                lvl = 10 ** self.noise_rng.uniform(-0.5, 0.0)  # ~0.3-1.0
+            self.noise_level = float(np.clip(lvl, 0.0, 1.0))
+            if self.noise_level < 0.03:
+                pool = ["gaussian_moderate", "uniform_moderate"]
+                p = [0.7, 0.3]
+            elif self.noise_level < 0.12:
+                pool = ["gaussian_moderate", "uniform_moderate", "cauchy_moderate"]
+                p = [0.5, 0.3, 0.2]
+            else:
+                pool = ["gaussian_severe", "uniform_severe", "cauchy_severe", "cauchy_moderate"]
+                p = [0.25, 0.25, 0.4, 0.1]
+            self.noise_variant = str(self.noise_rng.choice(pool, p=p))
         else:
-            self.noise_active = self._force_adds_noise
+            self.noise_level = 0.02
+            self.noise_variant = "gaussian_moderate"
         self.failure_value = None
-        self.failure_worst_quantile = float(opts.get("failure_worst_quantile", 0.15))
-        self.failure_worst_quantile = float(np.clip(self.failure_worst_quantile, 0.0, 0.95))
-        self.failure_worst_mode = str(opts.get("failure_worst_mode", "quantile_mask")).strip().lower()
-        if self.failure_worst_mode not in {"quantile_mask", "anchors"}:
-            raise ValueError("failure_worst_mode must be either 'quantile_mask' or 'anchors'.")
+        self.failure_worst_quantile = float(self.failure_rng.uniform(0.05, 0.18))
+        self.failure_worst_mode = "anchors"
         self.failure_worst_probe_count = int(
-            opts.get("failure_worst_probe_count", max(256, 80 * self.dim))
+            self.failure_rng.integers(max(64, 48 * self.dim), max(256, 120 * self.dim) + 1)
         )
-        self.failure_worst_probe_count = max(64, self.failure_worst_probe_count)
-        self.failure_worst_anchor_fraction = float(opts.get("failure_worst_anchor_fraction", 0.5))
-        self.failure_worst_anchor_fraction = float(
-            np.clip(self.failure_worst_anchor_fraction, 0.1, 2.0)
+        self.failure_worst_anchor_fraction = float(self.failure_rng.uniform(0.25, 0.9))
+        self.failure_worst_radius_scale = float(self.failure_rng.uniform(0.06, 0.18))
+        self.failure_min_valid_fraction = float(self.failure_rng.uniform(0.20, 0.60))
+        failure_budget = float(self.failure_rng.uniform(0.25, 0.85))
+        self.failure_max_fraction = min(failure_budget, 1.0 - self.failure_min_valid_fraction)
+        self.failure_budget_probe_count = int(
+            self.failure_rng.integers(max(64, 64 * self.dim), max(256, 144 * self.dim) + 1)
         )
-        self.failure_worst_radius_scale = float(opts.get("failure_worst_radius_scale", 0.22))
-        self.failure_worst_radius_scale = float(np.clip(self.failure_worst_radius_scale, 0.05, 0.8))
-        has_failure_shape_options = any(
-            key in opts
-            for key in (
-                "failure_regions",
-                "failure_region_density",
-                "failure_region_scale",
-                "failure_worst_quantile",
-                "failure_worst_mode",
-                "failure_worst_probe_count",
-                "failure_worst_anchor_fraction",
-                "failure_worst_radius_scale",
-            )
-        )
-        failure_requested = (
-            self._force_has_failure_regions is True
-            or has_failure_shape_options
-        )
-        if options and "failure_regions" in options:
-            self.failure_regions = int(options["failure_regions"])
-        else:
-            region_scale = float(options.get("failure_region_density", 1.0)) if options else 1.0
-            region_scale = max(0.0, region_scale)
-            self.failure_regions = max(2, int(round(self.dim * region_scale)))
-        if not failure_requested and self._force_has_failure_regions is None:
+        # Activation is controlled only by has_failure_regions.
+        region_scale = float(self.failure_rng.uniform(0.6, 1.6))
+        base_regions = max(1, int(round(self.dim * region_scale)))
+        low_regions = max(1, int(np.floor(0.5 * base_regions)))
+        high_regions = max(low_regions, int(np.ceil(1.5 * base_regions)))
+        sampled_regions = int(self.failure_rng.integers(low_regions, high_regions + 1))
+        self.failure_regions = sampled_regions
+        self.failure_region_scale = float(self.failure_rng.uniform(0.12, 0.30))
+        self.failure_as_constraint = True
+        self.failure_active = self._force_has_failure_regions is True
+        if not self.failure_active:
             self.failure_regions = 0
-        if self._force_has_failure_regions and self.failure_regions <= 0:
-            self.failure_regions = 1
-        self.failure_region_scale = float(options.get("failure_region_scale", 0.5)) if options else 0.5
-        self.failure_as_constraint = bool(opts.get("failure_as_constraint", True))
-        if self._force_has_failure_regions is None:
-            self.failure_active = self.failure_regions > 0 and failure_requested
-        else:
-            self.failure_active = self.failure_regions > 0 and self._force_has_failure_regions
         self._failure_shapes: list[dict[str, Any]] | None = None
         self.last_failure_mask: np.ndarray | None = None
         if self.failure_active:
@@ -964,6 +957,28 @@ class GPFunctionEnv:
         def scale_cap() -> float:
             return max(0.08, min(float(self.failure_region_scale), 0.45))
 
+        def cap_shape_locality(shape: dict[str, Any]) -> dict[str, Any]:
+            capped = dict(shape)
+            kind = str(capped.get("kind", ""))
+            if kind == "ellipsoid":
+                radii = np.asarray(capped.get("radii", []), dtype=float)
+                if radii.size:
+                    capped["radii"] = np.clip(radii, 0.03, 0.28 * scales)
+            elif kind in {"axis_band", "boundary_strip", "band"}:
+                capped["width"] = float(np.clip(float(capped.get("width", 0.0)), 0.01, 0.16))
+                if kind == "boundary_strip" and capped.get("anchor_radius") is not None:
+                    capped["anchor_radius"] = float(
+                        np.clip(float(capped["anchor_radius"]), 0.08, 0.35)
+                    )
+            elif kind == "interaction_band":
+                capped["width"] = float(np.clip(float(capped.get("width", 0.0)), 0.015, 0.14))
+                capped["span"] = float(np.clip(float(capped.get("span", 0.0)), 0.10, 0.45))
+            elif kind == "worst_quantile_region" and str(capped.get("mode", "")) == "anchors":
+                radii = np.asarray(capped.get("radii", []), dtype=float)
+                if radii.size:
+                    capped["radii"] = np.clip(radii, 0.03, 0.24 * scales)
+            return capped
+
         def build_worst_quantile_shape() -> dict[str, Any] | None:
             if self.failure_worst_quantile <= 0.0:
                 return None
@@ -1128,12 +1143,12 @@ class GPFunctionEnv:
                 group_a = categorical_groups[int(self.failure_rng.integers(0, len(categorical_groups)))]
                 cat_a = int(self.failure_rng.choice(group_a))
                 cat_b = None
-                if len(categorical_groups) > 1 and self.failure_rng.random() < 0.6:
+                if len(categorical_groups) > 1:
                     others = [g for g in categorical_groups if not np.array_equal(g, group_a)]
                     group_b = others[int(self.failure_rng.integers(0, len(others)))]
                     cat_b = int(self.failure_rng.choice(group_b))
                 numeric_gate = None
-                if numeric_indices and self.failure_rng.random() < 0.75:
+                if numeric_indices:
                     gate_axis = int(self.failure_rng.choice(numeric_indices))
                     gate_side = float(self.failure_rng.choice([-1.0, 1.0]))
                     gate_threshold = gate_side * float(self.failure_rng.uniform(0.65, 0.95))
@@ -1170,6 +1185,8 @@ class GPFunctionEnv:
             # Always include this coupled-to-worst region in addition to all sampled regions.
             shapes.append(worst_shape)
 
+        if shapes:
+            shapes = [cap_shape_locality(shape) for shape in shapes]
         self._failure_shapes = shapes
 
     def _resolve_failure_value(self, y: np.ndarray) -> float | np.ndarray:

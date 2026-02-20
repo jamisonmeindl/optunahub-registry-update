@@ -119,7 +119,7 @@ def _run_demo(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run synthetic GP benchmark demos.")
     parser.add_argument("--seeds", type=int, nargs="+", default=range(3), help="Seeds to evaluate.")
-    parser.add_argument("--dims", type=int, nargs="+", default=[2,5], help="Problem dimensions.")
+    parser.add_argument("--dims", type=int, nargs="+", default=[2,5,10,25], help="Problem dimensions.")
     parser.add_argument(
         "--data-type",
         choices=["Mixed", "Continuous"],
