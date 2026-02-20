@@ -213,6 +213,16 @@ class HEBOSampler(optunahub.samplers.SimpleBaseSampler):
             )
             suggestions = hebo.space.sample(1)
         params = self._transform_suggestions_to_dict(suggestions, search_space)
+        diagnostics = self._build_relative_suggestion_diagnostics(
+            params=params,
+            suggestions=suggestions,
+            search_space=search_space,
+            hebo=hebo,
+            trial_number=trial_number,
+            study=study,
+        )
+        if diagnostics is not None:
+            raise RuntimeError(diagnostics)
 
         if self._track_surrogate_predictions and not self._multi_objective:
             real_predictions = self._convert_suggestions_to_real_space(suggestions, search_space)
@@ -246,8 +256,159 @@ class HEBOSampler(optunahub.samplers.SimpleBaseSampler):
             if isinstance(value, np.generic):
                 value = value.item()
 
-            params[name] = value
+            if isinstance(value, float) and not math.isfinite(value):
+                continue
+
+            params[name] = HEBOSampler._normalize_param_value_for_distribution(value, dist)
         return params
+
+    @staticmethod
+    def _float_boundary_tolerance(distribution: FloatDistribution) -> float:
+        scale = max(1.0, abs(distribution.low), abs(distribution.high))
+        return max(1e-12, np.finfo(float).eps * scale * 8.0)
+
+    @staticmethod
+    def _normalize_param_value_for_distribution(
+        value: Any, distribution: BaseDistribution
+    ) -> Any:
+        if isinstance(value, np.generic):
+            value = value.item()
+
+        if isinstance(distribution, CategoricalDistribution):
+            if value in distribution.choices:
+                return value
+            value_str = str(value)
+            for choice in distribution.choices:
+                if str(choice) == value_str:
+                    return choice
+            return value
+
+        if isinstance(distribution, IntDistribution):
+            if isinstance(value, bool):
+                return value
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return value
+            if not math.isfinite(numeric):
+                return value
+            numeric = float(min(max(numeric, distribution.low), distribution.high))
+            if distribution.step is not None and distribution.step > 1 and not distribution.log:
+                snapped = (
+                    distribution.low
+                    + round((numeric - distribution.low) / distribution.step) * distribution.step
+                )
+                numeric = float(min(max(snapped, distribution.low), distribution.high))
+            return int(round(numeric))
+
+        if isinstance(distribution, FloatDistribution):
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return value
+            if not math.isfinite(numeric):
+                return value
+            tol = HEBOSampler._float_boundary_tolerance(distribution)
+            if numeric < distribution.low and numeric >= distribution.low - tol:
+                numeric = distribution.low
+            if numeric > distribution.high and numeric <= distribution.high + tol:
+                numeric = distribution.high
+            numeric = float(min(max(numeric, distribution.low), distribution.high))
+            if distribution.step is not None:
+                snapped = (
+                    distribution.low
+                    + round((numeric - distribution.low) / distribution.step) * distribution.step
+                )
+                if snapped < distribution.low and snapped >= distribution.low - tol:
+                    snapped = distribution.low
+                if snapped > distribution.high and snapped <= distribution.high + tol:
+                    snapped = distribution.high
+                numeric = float(min(max(snapped, distribution.low), distribution.high))
+            return numeric
+
+        return value
+
+    @staticmethod
+    def _is_valid_param_value(value: Any, distribution: BaseDistribution) -> bool:
+        if isinstance(distribution, CategoricalDistribution):
+            return value in distribution.choices
+        if isinstance(distribution, IntDistribution):
+            if isinstance(value, bool):
+                return False
+            if not isinstance(value, (int, np.integer)):
+                return False
+            v = int(value)
+            if v < distribution.low or v > distribution.high:
+                return False
+            step = distribution.step if distribution.step is not None else 1
+            return (v - distribution.low) % step == 0
+        if isinstance(distribution, FloatDistribution):
+            if not isinstance(value, (int, float, np.integer, np.floating)) or isinstance(value, bool):
+                return False
+            v = float(value)
+            if not math.isfinite(v):
+                return False
+            tol = HEBOSampler._float_boundary_tolerance(distribution)
+            if v < distribution.low - tol or v > distribution.high + tol:
+                return False
+            v = min(max(v, distribution.low), distribution.high)
+            if distribution.step is not None:
+                q = round((v - distribution.low) / distribution.step)
+                reconstructed = distribution.low + q * distribution.step
+                return math.isclose(v, reconstructed, rel_tol=0.0, abs_tol=1e-8)
+            return True
+        return True
+
+    def _build_relative_suggestion_diagnostics(
+        self,
+        *,
+        params: dict[str, Any],
+        suggestions: pd.DataFrame,
+        search_space: dict[str, BaseDistribution],
+        hebo: HEBO | GeneralBO,
+        trial_number: int | None,
+        study: Study | None,
+    ) -> str | None:
+        missing = [name for name in search_space if name not in params]
+        invalid = [
+            name
+            for name, dist in search_space.items()
+            if name in params and not self._is_valid_param_value(params[name], dist)
+        ]
+        if not missing and not invalid:
+            return None
+
+        problem: list[str] = []
+        if missing:
+            problem.append(f"missing={missing}")
+        if invalid:
+            invalid_desc = [
+                f"{name}(value={params[name]!r}, dist={search_space[name]!r})" for name in invalid
+            ]
+            problem.append(f"invalid={invalid_desc}")
+
+        suggestion_cols = list(suggestions.columns)
+        suggestion_dtypes = {name: str(dtype) for name, dtype in suggestions.dtypes.items()}
+        first_row = (
+            suggestions.iloc[0].to_dict() if not suggestions.empty else {}
+        )
+        search_space_repr = {
+            name: repr(dist) for name, dist in search_space.items()
+        }
+        backend_name = hebo.__class__.__name__
+        model_name = getattr(hebo, "model_name", None)
+        rand_sample = getattr(hebo, "rand_sample", None)
+        study_name = study.study_name if study is not None else None
+
+        return (
+            "HEBO returned incomplete/invalid relative parameters from sample_relative. "
+            f"{'; '.join(problem)}. "
+            f"trial_number={trial_number}, study_name={study_name}, backend={backend_name}, "
+            f"model_name={model_name}, rand_sample={rand_sample}, "
+            f"suggestion_columns={suggestion_cols}, suggestion_dtypes={suggestion_dtypes}, "
+            f"first_suggestion_row={first_row}, converted_params={params}, "
+            f"expected_search_space={search_space_repr}"
+        )
 
     def get_last_surrogate_predictions(self) -> pd.DataFrame | None:
         """Return the last candidate proposals annotated with HEBO's mean/std."""
@@ -836,8 +997,15 @@ class HEBOSampler(optunahub.samplers.SimpleBaseSampler):
     ) -> Any:
         states = (TrialState.COMPLETE,)
         trials = study._get_trials(deepcopy=False, states=states, use_cache=True)
-        if any(param_name in trial.params for trial in trials):
-            _logger.warn(f"Use `RandomSampler` for {param_name} due to dynamic search space.")
+        seen_in_completed = any(param_name in t.params for t in trials)
+        if seen_in_completed:
+            _logger.warning(
+                "Falling back to independent sampling for %s. "
+                "This usually means the parameter was not provided by sample_relative for this "
+                "trial (e.g. relative-search-space mismatch or backend suggestion transform "
+                "dropped the key), not necessarily a truly dynamic search space.",
+                param_name,
+            )
 
         return self._independent_sampler.sample_independent(
             study, trial, param_name, param_distribution
